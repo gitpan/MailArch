@@ -1,0 +1,67 @@
+MailArchive 1.9
+===============
+
+MailArchive is a Perl script which processes mail messages
+and stores them in a sort of archive provided with an hypertext index.
+The index is formatted in HTML (HyperText Markup Language) so that
+the archive can be managed by an HTTP server (such as NCSA httpd) and
+accessed by a WWW browser such as Lynx, Mosaic, Netscape, etc.
+The script optionally supports the creation and maintenance of a reverse
+index so that very efficient textual searches can be performed.
+The output of the search procedure is also HTML.
+MailArchive may be used to ease the organization of any kind of pieces
+of information which must be accessed by WWW browsers.
+
+
+MailArchive 1.9  may be found at:
+
+	ftp://ftp.arcetri.astro.it/pub/MailArchive/MailArch-1.9.tgz
+
+=========================================================================
+
+The compressed tar file contains the following files:
+
+COPYRIGHT       - The name says it all.
+
+MAsearch.pl	- An HTML form processing script which allows searches
+		  on an archive created by MailArchive.
+
+MailArchive   	- A mail filter and folder processor to create and
+		  maintain archives with hypertext index and searching
+		  capabilities.
+
+README		- This file
+
+
+
+
+USAGE
+=====
+
+MailArchive -h     Prints a brief usage page.
+
+MailArchive -m     Prints a full LaTeX manual.
+
+MailArchive -c     Prints a Copyright notice
+
+
+
+
+HISTORY
+=======
+
+Version 1.8.22               First public release, August 1995
+
+Version 1.9                  Debug release, December 1995
+                             Fixed a bug in expiration date parsing: Jan
+                             was rejected as incorrect month specification.
+                             Fixed a bug which prevented the use of the
+                             "!Subject:" line into the text.
+
+                             The middle digit in version number has been
+                             eliminated. Version 1.9 is immediately
+                             following version 1.8.22. The next minor
+                             (debug) release will be Version 1.10. The
+                             next major release will be Version 2.0.
+
+(lfini@arcetri.astro.it)

@@ -1,0 +1,49 @@
+#
+# MailArchive configuration file.
+#
+# Keywords must start at column one
+#
+
+
+				# Specify actual path to glimpseindex
+				# If the path is not specified, no reverse
+				# index will be created, and search will
+				# be performed with "grep"
+Glimpseindex:  /usr/local/bin/glimpseindex	
+
+				# If you specify Glimseindex, then you may want
+				# to specify also:
+#Index Numbers			# glimpseindex will also index numbers
+				# (By default only words are indexed
+
+				# Choose one of the following two:
+Flat List 			# make a flat document list
+				
+#Nested	List 			# Make a nested list (main list points to
+				# sublists each one containing only one year)
+
+#List Head: <blockquote>
+#List Line: $Date - <a href=$URL>$S</a><br>
+#List Tail: </blockquote>
+
+MailCommand:  /usr/ucb/mail -s \"MailArchive Reply\" $Sender < $MailMessage
+
+#Sort: sort +3nr -4 +2Mr -3 +1nr -2
+
+#Require Expiration		# The document is not accepted unless an
+				# expiration date is specified
+
+#Require Subject		# The document is not accepted unless a
+				# subject is specified
+
+#Default life: 10		# Life time (in days) if expiration date
+				# is not specified
+
+Allow				# Begin list of allowed mail addresses
+				# (No comments allowed on regular expressions)
+^lfini(\@(.*\.)?arcetri\.astro\.it)?
+End Allow			# End list of allowed mail addresses
+
+#wwwPath: /TheArchive/		# The path to the archive main directory
+				# as seen from a WWW browser connected
+				# to the HTTP server.

@@ -1,0 +1,2199 @@
+#!/usr/local/bin/perl -U
+$Program= 'MailArchive';
+$Version= '1.9';
+$Author = 'Luca Fini';
+$Date   = 'Dec 1995';
+
+#########################################################################
+# History:
+# Vers. 1.8.22  Aug 1995
+#########################################################################
+#
+# Mail message archiver
+#
+# This filter reads mail messages and organizes an archive provided with
+# a hypertext index. Messages are ordered by date in the index.
+# A message expiration mechanism is provided.
+#
+# A brief usage note is printed if the script is invoked without arguments.
+#
+#
+# Author: Luca Fini, Osservatorio Astrofisico di Arcetri
+#
+#         lfini@arcetri.astro.it
+#
+
+$Header = "$Program  Vers. $Version 		- $Author $Date";
+
+$Stars = "***************************************************************\n";
+$hrule = "---------------------------------------------------------------\n";
+$|=1;
+
+@Months = ('jan','feb','mar','apr','may','jun',
+               'jul','aug','sep','oct','nov','dec');
+@DaysOfWeek = ('Mon','Tue','Wed','Thu','Fri','Sat','Sun');
+%MonthNums = ('jan',0,'feb',1,'mar',2,'apr',3,'may',4,'jun',5,
+              'jul',6,'aug',7,'sep',8,'oct',9,'nov',10,'dec',11);
+
+@Exclude = ('mailserv','listserv','daemon','mailer');
+
+$Nretries=10;		# Number of retries when the archive is locked
+$Ndelay  =10;		# Retry interval
+
+undef $Mail;
+					# Line separating messages in a folder
+$FolderSep    = '^From\s+(\S+)\s+(\S+)\s+(\S+)';
+
+$SubjectFlag  = '^Subject:\s*';		# Subject field in message header
+$FromFlag     = '^From:\s*';		# Sender field in message header
+$DateFlag     = '^Date:\s*';		# Date field in message header
+
+$ForceDate    = '^!Date:\s*';	# Forced date field in message body
+$ForceFrom    = '^!From:\s*';	# Forced from field in message body
+$ForceSubj    = '^!Subject:\s*';	#Forced Subject field
+$ExpireDate   = '^!Expir[^:]*:\s*';
+$DaysOfLife   = '^!Life[^:]*:\s*';
+$DirTemplate  = '^\d{4}$';
+$FileTemplate = '^(E|N)\w{3}\d{1,2}-\d+\.txt$';
+$ExpirTemplate = '^E\w{3}\d{1,2}-\d+\.txt$';
+$ExpireKeywd    = 'Expiration:';
+$DateKeywd      = 'Date:';
+$FromKeywd      = 'From:';
+$SubjectKeywd   = 'Subject:';
+
+$MailMessage="/tmp/Tmp$$";			# Temporary log file
+
+$BeginFlag = '<!--Begin>';
+$EndFlag = '<!--End>';
+
+$HTMLtemplate = '.MAtemplate';
+$IncludeHere  = '<!--\s*Include\s*Point';
+
+$ExpRequired='';
+$SubRequired='';
+undef $DoIndex;
+undef $DefaultLife;
+undef $ListLine;
+
+$Nested=1;
+$IndexNumbers='';
+$Debug=0;
+$Acknowledge=0;
+$Mode='';
+$Date='S';
+$Home='';
+undef $DeleteLock;
+undef $Interactive;
+undef $Unconditional;
+undef @Allowed;
+
+for($i=0; $i<=$#ARGV; $i++) {
+	$arg = $ARGV[$i];
+	if($arg =~ /^-/) {
+		$Interactive=1;
+		if($arg =~ /^-r$/i) {
+			$Mode = 'R';
+		} elsif($arg =~ /^-d$/i) {
+			$Debug=1;
+		} elsif($arg =~ /^-f$/i) {
+			$i++;
+			$InputFile=$ARGV[$i];
+		} elsif($arg =~ /^-u$/i) {
+			$Unconditional=1;
+		} elsif($arg =~ /^-c$/i) {
+			&Help('__COPYRIGHT__');
+			&MyExit;
+		} elsif($arg =~ /^-x$/i) {
+			$Mode='E';
+		} elsif($arg =~ /^-v$/i) {
+			print $Version;
+			&MyExit;
+		} elsif($arg =~ /^-m$/i) {
+			&Help('__MANUAL__');
+			&MyExit;
+		} else {
+			&Help;
+			&MyExit;
+		}
+	} else {
+		$arg =~ /(\S+)/;
+		if($Home eq '') { 
+			$Home = $1; 
+		}
+	}
+}
+
+unless($Interactive) {
+	open(TMP_STDOUT,">$MailMessage") || &MyDie("Cannot open temporary log file $MailMessage");
+	open(STDERR,">&TMP_STDOUT") || &MyDie("Cannot dup STDERR");
+	select(TMP_STDOUT);
+}
+
+$NewYears=0;
+
+if($Home eq '') {
+	&MyUsage("You must specify an archive Home directory\n\nUse: -h to get help");
+}
+
+if($Home =~ /\/$/) { chop $Home; }
+if($Home =~ /([^\/]+)$/) {
+	$Folder=$1;
+} else {
+	$Folder=$Home;
+}
+
+unless(-e $Home) { 
+	&MyUsage("Archive main directory $Home doesn't exist");
+}
+
+
+$LockFile = "$Home/MAlock";
+while(-e $LockFile) {
+	if($Nretries-->0) {
+		print "Waiting for unlock\n";
+		sleep($Ndelay);
+	} else {
+		local $ns=$Nretries*$Ndelay;
+		&MyUsage("The archive has been locked for $ns seconds,\n" .
+		       "something may be wrong: contact the archive manager");
+	}
+}
+	
+open(TEMP,">$LockFile")||&MyDie("Cannot open lock file: $LockFile");
+close TEMP;
+
+$DeleteLock=1;
+
+$ConfigFile = "$Home/.MAconfig";
+$CnfigList{'Index Numbers'} = NO;
+$CnfigList{'Mail Cmd'} = '';
+$CnfigList{'Index Cmd'} = '';
+$CnfigList{'List'} = 'Nested';
+$CnfigList{'Require Exp'} = NO;
+$CnfigList{'Require Sub'} = NO;
+$CnfigList{'Life Time'} = '';
+$CnfigList{'Notify to'} = '';
+$CnfigList{'wwwPath'} = "/$Folder/";
+$CnfigList{'Sort'} = 'sort +3nr -4 +2Mr -3 +1nr -2';
+$CnfigList{'List Head'} = '<dl>';
+$CnfigList{'List Line'} = '<dt> $Date - From: $From $Expir <dd>$Anchor<p>';
+$CnfigList{'List Tail'} = '</dl>';
+
+open(TEMP,$ConfigFile)|| &MyDie("Cannot open config file: $ConfigFile");
+
+while(<TEMP>) {
+	chop;
+	s/\s*#.*$//;				# Strip comments
+	if(/^\s*$/) { next; }
+	if(/^Index\s*Numbers/i) {
+		$IndexNumbers='-n';
+		$CnfigList{'Index Numbers'}=YES;
+	} elsif(/^Mail\s*Command:\s+(.*)/i) {
+		$CnfigList{'Mail Cmd'} = $1;
+	} elsif(/^Glimpseindex:\s*(\S+)/i) {
+		$DoIndex=1;
+		$CnfigList{'Index Cmd'} = $1;
+	} elsif(/^wwwPath:\s*(\S+)/i) {
+		$CnfigList{'wwwPath'} = $1;
+	} elsif(/^Flat\s+List/i) {
+		$CnfigList{'List'} = 'Flat';
+		$Nested=0;
+	} elsif(/^Nested\s+List/i) {
+		$Nested=1;
+		$CnfigList{'List'} = 'Nested';
+	} elsif(/^Require\s+(\S+)/i) {
+		$what=$1;
+		if($what=~/Expiration/i) {
+			$CnfigList{'Require Exp'} = YES;
+			$ExpRequired=1;
+		} elsif($what=~/Subject/i) {
+			$CnfigList{'Require Sub'} = YES;
+			$SubRequired=1;
+		}
+	} elsif(/^List\s*Head:\s*(.+)/i) {
+		$CnfigList{'List Head'} = $1;
+	} elsif(/^List\s*Tail:\s*(.+)/i) {
+		$CnfigList{'List Tail'} = $1;
+	} elsif(/^List\s*Line:\s*(.+)/i) {
+		$CnfigList{'List Line'} = $1;
+	} elsif(/^Notify\s*to:\s*(\S+)/i) {
+		$CnfigList{'Notify to'} = $1;
+	} elsif(/^Life\s*Time:\s*(\S+)/i) {
+		$DefaultLife=$1;
+		$CnfigList{'Life Time'} = $1;
+	} elsif(/^Sort:\s*(.+)/i) {
+		$CnfigList{'Sort'} = $1;
+	} elsif(/^Allow/i) {
+		while(<TEMP>) {
+			chop;
+			if(/^\s*$/) { next; }
+			if(/^End\s*Allow/i) { last; }
+			push(@Allowed,$_);
+		}
+	}
+}
+close TEMP;
+
+$ListLine= $CnfigList{'List Line'};
+			
+if($Interactive) { $Acknowledge=0; }
+
+if($Unconditional) { undef @Allowed; }
+
+local($lss,$lmm,$lhh,$lmd,$lmo,$lyy)=localtime;
+
+$SortCmd=$CnfigList{'Sort'};
+
+if($Debug) {
+	print "$Program: Begin on $lmd $Months[$lmo] $lyy";
+	printf(" %d:%2.2d:%2.2d\n",$lhh,$lmm,$lss);
+	print "\n$Header\n\n";
+	&Printenv;
+}
+
+$TmpFile   = "$Home/list.tmp";
+
+if($Debug) {
+	&Printfiles;
+}
+
+&SetUID;				# set UID to that of owner of Archive
+					# home directory.
+
+if($Mode eq R) {			# Recreate list
+	&ReBuild;
+	if($Nested) { &MakeMainIndex;}
+} elsif($Mode eq E) {
+	&DoExpire;
+} else {
+	&Build;
+	if($NewYears && $Nested ) {		# Update Main index
+		&MakeMainIndex;
+	}
+}
+
+if($DoIndex) {
+	if($Mode eq R) {	# Incremental index unless rebuild
+		$Incr='';
+	} else { 
+		$Incr ='-f'; 
+	}
+	&MySystem("$CnfigList{'Index Cmd'} $IndexNumbers $Incr -H $Home $Home");
+	chmod 0644, "$Home/.glimpse_filenames";
+	chmod 0644, "$Home/.glimpse_index";
+	chmod 0644, "$Home/.glimpse_messages";
+	chmod 0644, "$Home/.glimpse_partitions";
+}
+
+unlink($TmpFile);
+
+unless($Interactive) {
+	print "------------------------------------------------------\n";
+	print "AUTOMATIC MESSAGE. DO NOT REPLY!\n\n";
+	print "    Reply to: $Sender\n";
+	print "Processed by: $Program $Version\n\n";
+	print "Your message about: $Subject\n";
+	print "  added to archive: $Home\n";
+	print "------------------------------------------------------\n";
+} 
+
+&MyExit;
+
+1;
+
+				#############################################
+sub Help {			# Printout help messages and manual.
+
+	local($Flag)=@_;
+
+	if($Flag) {
+		while(<DATA>) {			# Skip over 
+			if(/^$Flag/) { last; } 
+		}
+	}
+
+	while(<DATA>) {
+		if(/^PRINTHEADER/) {
+			print "\n$Header\n\n";
+		} elsif(/^PRINTVERSION/) {
+			print "(Version $Version)\n";
+		} else {
+			if(/^__/) { return; } 
+			print;
+		}
+	}
+} 
+				#############################################
+sub Build {			# Create structure from mail messages
+
+local($ListFile)='';		# Clear list file name
+
+if(defined $InputFile) {
+	open(STDIN,"$InputFile") || 
+		&MyDie("Cannot open input file: $InputFile");
+}
+
+$TheLine=<STDIN>;
+do {
+	&Message;
+} while($TheLine =~ /$FolderSep/);
+
+&CloseCurList;
+}
+
+
+sub Message {				# Process a mail message
+
+local($Dmo,$Dmd,$Dyr,$Nfile,$FileBase,$FileName,$Nlines);
+
+undef $FromLine;
+undef $Subject;
+undef $Date;
+undef $Expire;
+undef $FDate;
+undef $FFrom;
+undef $FSubj;
+undef $LifeSpan;
+
+unless(&GetMail) { &MyReject("Empty mail message"); }
+
+unless($FromLine) { 
+	&MyReject("The message has not a From field"); 
+}
+
+if($FromLine =~ /<\s*([^>]*)\s*>/) {		# Parse From field
+	$Sender=$1;
+} elsif ($FromLine =~ /^\s*(\S+)\s*/) {
+	$Sender=$1;
+} else {
+	&MyReject("Error parsing From field\nFrom: $FromLine");
+}
+
+if($FDate) { $Date = $FDate; }
+
+($Dmd,$Dmo,$Dyr,$msg)=&GetDate($Date);
+
+if($Dmd==0) { &MyReject($msg); }
+
+$SubDEBUG=0;
+
+if($Subject =~ /^!DEBUG/) {
+	$SubDEBUG=1;
+	$Debug=1;
+	print "\n\n",$Stars;
+	print "\n$Header\n\n";
+	print "$Program: ******** Answer to DEBUG request\n";
+	print "Sender: $Sender\n";
+	&Printenv;
+	&Printfiles;
+}
+
+if($Expire) {
+	$ExpireFlag=E;
+} else {
+	$ExpireFlag='N';
+}
+
+if($FFrom) {
+	$FromLine=$FFrom;
+}
+
+if($FSubj) {
+	$Subject=$FSubj;
+}
+
+if($Subject =~ /^\s*$/) {
+	if($SubRequired) {
+		&MyReject("You must specify a Subject for the message !!");
+	} else {
+		$Subject='No Subject';
+	}
+}
+
+$IsAllowed=OK;
+
+if((! $Interactive) && (defined @Allowed)) {
+	$IsAllowed='';
+	foreach $user (@Allowed) {
+		if($Sender =~ /$user/i) { $IsAllowed=$user; last; }
+	}
+}
+unless($IsAllowed) {
+	&MyReject("You are not allowed to put a message into the archive !!");
+}
+
+if($Debug) {
+	print "DBG> Sender '$Sender' matches\n";
+	print "DBG>        /$IsAllowed/\n\n";
+}
+
+
+$NumDate=&MyTimelocal($Dmd,$MonthNums{$Dmo},$Dyr);	# Numerical date
+
+if($Expire || $LifeSpan || $DefaultLife) {
+	&ProcessExpiration;
+}
+
+if($ExpRequired && !$Expire) {
+	MyReject("You MUST specify an Expiration date !!");
+}
+
+&CheckYear;
+
+$Nfile=0;
+
+if($SubDEBUG) {
+	&MyReject("Replying to DEBUG request");
+}
+
+do {						# Generate File name
+	$FileBase = sprintf("${ExpireFlag}${Dmo}%2.2d-%2.2d.txt",$Dmd,$Nfile);
+	$FileName = "$Home/$Dyr/$FileBase";
+	$Nfile++;
+} until ! -e $FileName ;
+
+open(BODY, ">$FileName") || &MyDie("Cannot open file: $FileName");
+
+
+&PutHeader('BODY');
+
+open(TMP, "$TmpBody") || &MyDie("Cannot read from temporary file: $TmpBody");
+
+while(<TMP>) {
+	print BODY;
+}
+close BODY;
+close TMP;
+chmod 0644, $FileName;
+
+if($Expire) { utime($FileExpirTime,$FileExpirTime,$FileName); }
+
+$TheDate = sprintf("%2d %s %4d",$Dmd,$Dmo,$Dyr);
+&PutRecord($TheDate,$Expire,$FromLine,$FileBase,$Subject,$Dyr);
+unlink $TmpBody;
+return 1;
+}
+
+sub PutHeader {
+	local($where)=@_;
+
+	print $where "$FromKeywd $FromLine\n";
+	print $where "$DateKeywd $Dmd $Dmo $Dyr\n";
+	if($Expire) {
+		print $where "$ExpireKeywd $Expire\n";
+	}
+	
+	print $where "$SubjectKeywd $Subject\n\n";
+}
+
+sub GetDate {
+	local($Date) = @_;
+	local($yr,$mo,$md);
+
+	unless($Date) { 
+		return (0,0,0,"The message has not a Date field");
+	}
+
+	unless($Date =~ /(\w{3},)?\s*(\d{1,2})\s+(\w{3})\s+(\d{2,4})/) {
+		return (0,0,0,"Error parsing Date field\nDate: $Date");
+	}
+	$md=$2; 				# Extract date
+	($mo=$3) =~ tr/A-Z/a-z/;
+	unless(grep(/$mo/,@Months)) {
+		return (0,0,0,"Month name error in date\nDate: $Date");
+	}
+	$yr=$4;
+
+	if($yr<1000) {				# Convert year to 4 digits
+		unless($yr<100) {
+			return (0,0,0,"Year error in date\nDate: $Date");
+		}
+		if($yr<70) {
+			$yr += 2000;	# Long life to this program !
+		} else {
+			$yr += 1900;	
+		}
+	}
+	return($md,$mo,$yr,'');
+}
+
+sub GetMail {				# Read in a mail message
+
+while($TheLine=<STDIN>) {		# Get header information
+	chomp $TheLine;
+	if($TheLine=~/$SubjectFlag/) { $Subject = $'; }
+	if($TheLine=~/$FromFlag/) { $FromLine = $'; }
+	if($TheLine=~/$DateFlag/) { $Date = $'; }
+	if($TheLine=~/^\s*$/) { last; }
+}
+
+$TmpBody = "$Home/MailTMP";
+
+open(TMP, ">$TmpBody") || &MyDie("Cannot open temporary file: $TmpBody");
+
+$Nlines=0;
+
+while($TheLine=<STDIN>) {				# Now process file body
+	chomp $TheLine;
+	if($TheLine=~/$FolderSep/) { 
+		local($dw,$mm)=($2,$3);
+		if(grep(/$dw/i,@DaysOfWeek) &&
+		   grep(/$mm/i,@Months)) { last; }
+	}
+	if($TheLine=~/$ExpireDate/) {
+		$Expire=$';
+	} elsif($TheLine=~/$DaysOfLife/) {
+		$LifeSpan=$';
+	} elsif($TheLine=~/$ForceDate/) {
+		$FDate=$';
+	} elsif($TheLine=~/$ForceSubj/) {
+		$FSubj=$';
+	} elsif($TheLine=~/$ForceFrom/) {
+		$FFrom=$';
+	} else {
+		print TMP $TheLine,"\n";
+		$Nlines++;
+	}
+}
+
+close TMP;
+
+if($Nlines==0) {
+	unlink($TmpBody);
+	return 0;
+}
+
+return 1;
+}
+				##########################################
+sub ProcessExpiration {		# Process expiration date
+	local($ss,$mi,$hr);
+
+	$NumLife = 0;
+	$NumExp = 0;
+	if($LifeSpan) {		# Compute expiration based on lifetime
+		$NumLife = $NumDate + $LifeSpan * 86400;
+	} elsif($Expire ne '') {
+		unless($Expire =~ /(\d{1,2})\W+([a-zA-Z]{3})\W+(\d{4})/) {
+			&MyReject("Expiration date ($Expire) syntax error\nSpecify the date as in the example: 31 jan 1996");
+		}
+		$Emd=$1;
+		($Emo=$2) =~ tr/A-Z/a-z/;
+		$Eyr=$3;
+		unless(defined $MonthNums{$Emo}) {
+			&MyReject("Illegal month in expiration date ($Expire)");
+		}
+		$mn=$MonthNums{$Emo};
+		$NumExp = &MyTimelocal($Emd,$mn,$Eyr);
+	} elsif($DefaultLife) {
+		$NumLife = $NumDate + $DefaultLife*86400;
+	} else {
+		$NumExp = $NumDate;
+	}
+
+	if($NumExp<$NumLife) { $NumExp=$NumLife; }
+	($ss,$mi,$hr,$Emd,$Emo,$Eyr) = localtime($NumExp);
+
+	$Eyr = ($Eyr>=70) ? $Eyr+1900 : $Eyr+2000;
+
+	$Emo=$Months[$Emo];
+	$FileExpirTime = $NumExp+43200;
+	$Expire = "$Emd $Emo $Eyr";
+}
+	
+
+sub ReBuild {			# Recreate index from text files
+
+	opendir(THEDIR,$Home) || &MyDie("Cannot open directory: $Home");
+
+	while($TheDir=readdir(THEDIR)) {
+		if($TheDir =~ /$DirTemplate/) {
+			&RebuildSubdir($TheDir);
+		}
+	}	
+}
+
+sub RebuildSubdir {
+	local($Dyr)=@_;
+	local($SubDir)="$Home/$Dyr";
+
+	open(TEMP,">$TmpFile") || 
+		&MyDie("Cannot create temporary file: $TmpFile");
+	opendir(THESUBDIR,$SubDir) || 
+		&MyDie("Cannot open directory: $SubDir");
+
+	while($Tfile=readdir(THESUBDIR)) {
+        	if($Tfile =~ /$FileTemplate/) {     # Recognize text files
+                	$Found=0;
+                	$Fn = "$SubDir/$Tfile";
+                	open(INP,$Fn) || &MyDie("Cannot open input file: $Fn");
+                	while(<INP>) {
+                        	chop;
+                        	if(/$FromKeywd\s+/) {
+                                	$From=$';
+				} elsif(/$ExpireKeywd\s+/) {
+                                	$Expiration=$';
+                        	} elsif(/$DateKeywd\s+/) {
+                                	$Date=$';
+                        	} elsif(/$SubjectKeywd\s+/) {
+                                	$Subject=$';
+                                	last;
+                        	}
+                	}
+                	close INP;
+
+			if($Date) {
+				&PutRecord($Date,$Expiration,$From,$Tfile,$Subject,$Dyr);
+			} else {
+				print "Malformed text file: $Tfile\n";
+			}
+	        }
+	}
+	&CloseCurList;
+}
+
+sub PutRecord {
+	local($Date,$Exp,$From,$Fn,$S,$Yr,$Path) = @_;
+	local($Expir);
+
+	local($Anchor)="<a href=$CnfigList{'wwwPath'}$Yr/$Fn>$S</a>";
+
+	if($Nested) {
+		$lf="$Home/${Yr}index.html";
+	} else {
+		$lf="$Home/index.html";
+	}
+	&GetListFile($lf);
+	if($Exp) {
+		$Expir=" (Expires: $Exp) ";
+	} else {
+		$Expir='';
+	}
+		
+	eval 'print TEMP "' . "$ListLine" . '\n"';
+
+	if($Interactive) {
+		print "Created record: $Date - From: $From $S\n";
+	}
+}
+
+sub MyDie {
+	local($msg) = @_;
+
+	print "\n\n", $Stars;
+	print "$Program Vers. $Version -- SYSTEM ERROR:\n";
+	print "$msg\n";
+	print "Error message: $!\n";
+	print $Stars, "\n";
+	&MyExit;
+}
+
+sub MyUsage {
+	local($msg) = @_;
+
+	print "\n\n", $Stars;
+	print "$Program Vers. $Version -- USAGE ERROR:\n";
+	print "$msg\n";
+	print $Stars, "\n";
+	&PutBody;
+	&MyExit;
+}
+
+sub MyReject {
+	local($msg) = @_;
+
+	print "\n\n", $Stars;
+	print "$Program Vers. $Version -- MESSAGE REJECTED:\n";
+	print "Your message has been rejected because:\n";
+	print "$msg\n";
+	print $Stars, "\n";
+	&PutBody;
+	&MyExit;
+}
+
+sub PutBody {
+	if(-e $TmpBody) {
+		print "Extracted message follows:\n\n";
+		print $hrule;
+		if($Interactive) {
+			&PutHeader(STDOUT);
+		} else {
+			&PutHeader(TMP_STDOUT);
+		}
+		open(TMP, $TmpBody);
+		while(<TMP>) { print; }
+		close TMP;
+		print $hrule;
+	}
+}
+	
+sub Clean {
+	close TEMP;
+	close TMP;
+	close TMP_STDOUT;
+	unless($Debug) {		# If debug mode, do not delete 
+					# temporary files.
+		unlink $TmpFile;
+		unlink $TmpBody;
+		unlink $MailMessage;
+	}
+	if($DeleteLock) { unlink $LockFile; }
+}
+	
+sub MyExit {
+	close TMP_STDOUT;
+	if(-e $MailMessage) {
+		local($Mail);
+		eval "\$Mail=\"$CnfigList{'Mail Cmd'}\"";
+		if($Mail && !$Interactive) {
+			local($e,$s);
+			$s=$Sender;
+			$s =~ s/\@.*$//;		# Extract domain
+			foreach $e (@Exclude) {		# avoid to reply to 
+							# mailers
+				if($s =~ /$e/i) {
+					$Mail='';
+				}
+			}
+			if($Mail) {
+				&MySystem($Mail);
+			}
+		} else {
+			&MySystem("cat $MailMessage");
+		}
+	}
+	&Clean;
+	exit;
+}
+
+sub Printenv {
+print "\n";
+foreach $key (sort(keys %ENV)) {
+	print "ENV> $key: ",$ENV{$key},"\n";
+}
+}
+
+sub Printfiles {
+print   "DBG> Stdout File: $MailMessage\n";
+print   "DBG>   Lock File: $LockFile\n";
+print   "DBG> Config File: $ConfigFile\n";
+print   "DBG>   Temp File: $TmpFile\n";
+
+if(defined $InputFile) {
+	print   "DBG>  Input File: $InputFile\n";
+}
+print "\nDBG> From Configuration file:\n";
+
+foreach $k (keys %CnfigList) {
+	printf "DBG> %16s: %s\n", $k, $CnfigList{$k};
+}
+
+if(@Allowed) {
+	print "\nDBG> Only users matching the following regular expressions\n";
+	print "DBG> are allowed to add to the archive\n";
+	foreach $user (@Allowed) {
+		print "DBG>      /$user/i\n";
+	}
+}
+
+print "\nDBG> Will not reply to addresses containing the following usernames:\n";
+	print "DBG> /",join('/ /',@Exclude), "/\n\n";
+}
+
+sub MySystem {			# &MySystem($command);
+	local($Cmd) = @_;
+	local($s);
+	system $Cmd;
+	$s = ($? >> 8);
+	if($s != 0) {
+		&Clean;
+		die("Cannot issue command: $Cmd");
+	}
+}
+
+sub CheckYear {			# Test if Year directory exist and create one, if not
+	local($dir)="$Home/$Dyr";
+	if( -e $dir) {
+		return 1;
+	}
+	mkdir($dir,0777) || &MyDie("Cannot create directory: $dir");
+	chmod 0755, $dir;
+	$NewYears=1;
+}
+
+sub GetListFile {				# Open list file when necessary
+	local($NewListFile)=@_;
+	if($NewListFile eq $ListFile) {
+		return;				# Continue on same list file
+	}
+	&CloseCurList;				# Close current list file
+
+	$ListFile = $NewListFile;
+
+	open(TEMP,">$TmpFile") || 
+		&MyDie("Cannot create temporary file: $TmpFile");
+
+	if(($Mode ne 'R')&&(-e $ListFile)) {		# Read next list file
+		open(INDEX,"$ListFile") || 
+			&MyDie("Cannot open list file: $ListFile");
+		while(<INDEX>) {
+			if(/^$BeginFlag/) { last; }
+		}
+		while(<INDEX>) {
+			if(/^$EndFlag/) { last; }
+			print TEMP $_;
+		}
+		close INDEX;
+	} 
+					# Create a new list file header
+	open(INDEX,">$ListFile") || 
+		&MyDie("Cannot create new list file: $ListFile");
+
+	unless($Nested) {
+		$TmplFile="$Home/$HTMLtemplate";
+	} else {
+		$TmplFile='';
+	}
+	if($TmplFile && -e $TmplFile) {
+		open(TEMPI,$TmplFile) || &MyDie("Cannot open template file: $TmplFile");
+		while(<TEMPI>) {
+			if(/$IncludeHere/i) { last; }
+			print INDEX;
+		}
+	} else {
+		$TmplFile="";
+		print INDEX "<head>\n";
+		print INDEX "<title> Index for $Folder/$Dyr </title>\n";
+		print INDEX "</head>\n";
+		print INDEX "<body>\n";
+		print INDEX "<h1> Index for folder: $Folder/$Dyr </h1>\n";
+		print INDEX "<dl>\n";
+	}
+	if($CnfigList{'List Head'}) {
+		print INDEX $CnfigList{'List Head'}, "\n";
+	}
+	print INDEX "$BeginFlag\n";
+
+	close INDEX;
+}
+
+sub CloseCurList {
+	if($ListFile eq '') { return; }
+	close TEMP;
+	if($SortCmd) {
+		&MySystem("$SortCmd $TmpFile >> $ListFile");
+	}
+
+	open(INDEX,">>$ListFile") || &MyDie("Cannot append to list file: $ListFile");
+	print INDEX "$EndFlag\n";
+	print INDEX $CnfigList{'List Tail'}, "\n";
+	if($TmplFile) {
+		while(<TEMPI>) {
+			print INDEX;
+		}
+		close TEMPI;
+	} else {
+		print INDEX "</body>\n";
+	}
+
+	close INDEX;
+	chmod 0644, $ListFile;
+	$ListFile='';
+}
+
+sub MakeMainIndex {
+	if($Nested) {
+		&MakeItDeep;
+	}
+}
+sub MakeItDeep {
+	undef %AllYears;
+	opendir(DIR,$Home)||MyDie("Cannot open home directory: $Home");
+	while($Thedir=readdir(DIR)) {
+		if($Thedir =~ /$DirTemplate/) {
+			$AllYears{$Thedir}=1;
+		}
+	}
+	closedir(DIR);
+	$MainIndexFile="$Home/index.html";
+	open(TEMP,">$MainIndexFile")|| &MyDie("Cannot open main index file: $MainIndexFile");
+	$TmplFile="$Home/$HTMLtemplate";
+	if(-e $TmplFile) {
+		open(TEMPI,$TmplFile) || &MyDie("Cannot open template file: $TmplFile");
+		while(<TEMPI>) {
+			if(/$IncludeHere/i) { last; }
+			print TEMP;
+		}
+	} else {
+		$TmplFile="";
+		print TEMP "<html>\n<head>\n<title>Main index File</title>\n</head>\n";
+		print TEMP "<body>\n<h1>Index for folder: $Folder</h1>\n";
+	}
+	print TEMP "<ul>\n";
+	print TEMP "$BeginFlag\n";
+	foreach $a (sort(keys %AllYears)) {
+		print TEMP "<li> <A href=${a}index.html>$a</A>\n";
+	}
+	print TEMP "$EndFlag\n";
+	print TEMP "</ul>\n";
+
+	if($TmplFile) {
+		while(<TEMPI>) {
+			print TEMP;
+		}
+		close TEMPI;
+	}
+	print TEMP "</body>\n</html>\n";
+	close TEMP;
+}
+
+sub MyTimelocal {		# Numerical value of dd-mm-yy 12:00:00
+
+require 'timelocal.pl';
+
+local($dd,$mm,$yy)=@_;
+
+$yy %= 100;
+
+return &timelocal(0,0,12,$dd,$mm,$yy);	# Numerical date
+}
+
+sub DoExpire {			# Remove expired files from database
+undef %AllYears;
+	
+opendir(THEDIR,$Home) || &MyDie("Cannot open directory: $Home");
+
+$MustMakeMainIndex=0;
+
+while($TheDir=readdir(THEDIR)) {
+	if($TheDir =~ /$DirTemplate/) {
+		&ExpirSubdir($TheDir);
+	}
+}	
+
+if($Nested) {
+	foreach $y (keys %AllYears) {
+		&UpdList($y);
+	}
+} else {
+	&UpdList(ALL);
+}
+
+if($MustMakeMainIndex && $Nested ){ &MakeMainIndex; }
+}
+
+
+sub ExpirSubdir {
+	local($Year)=@_;
+	local($List) = $Nested ? $Year : 'ALL';
+	local($SubDir)="$Home/$Year";
+	local($ExpDir)="$Home/Expired";
+	local($TheTime) = time;
+
+	unless(-e $ExpDir) {
+		mkdir($ExpDir,0777) || &MyDie("Cannot create directory: $ExpDir");
+		chmod 0755, $ExpDir;
+	}
+
+	opendir(THESUBDIR,$SubDir) || 
+		&MyDie("Cannot open directory: $SubDir");
+
+	while($Tfile=readdir(THESUBDIR)) {
+        	if($Tfile =~ /$ExpirTemplate/) {     # Recognize text files
+                	$Found=0;
+                	$Fn = "$SubDir/$Tfile";
+			$Checkn = "$Year/$Tfile";
+                	$ExpFn = "$ExpDir/$Year$Tfile";
+			local($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,
+			      $size,$atime,$mtime) = stat($Fn);
+			if( $mtime < $TheTime) {
+				$AllYears{$List}=1;
+				rename($Fn,$ExpFn);
+				print "File $Fn moved to $ExpFn\n";
+				push(@{"rm$List"},$Checkn);
+			}
+		}
+	}
+	closedir THESUBDIR;
+}
+
+sub UpdList {
+	local($Year)=@_;
+	local($List) = $Nested ? $Year : '';
+	if($#{"rm$Year"}>=0) { 				# Update file list;
+		$Nlist=0;
+		$ListFile = "$Home/${List}index.html";
+		open(LIST,$ListFile)||MyDie("Cannot open list file $ListFile");
+		open(TEMP,">$TmpFile") || 
+			&MyDie("Cannot create temporary file: $TmpFile");
+		while($l=<LIST>) {
+			print TEMP $l;
+			if($l=~/$BeginFlag/) { last; }
+		}
+		while($l=<LIST>) {
+			if($l =~ /$EndFlag/) {
+				print TEMP $l;
+				last;
+			}
+			unless(grep($l=~/$_/,@{"rm$Year"})) {
+				$Nlist++;
+				print TEMP $l;
+			}
+		}
+		while($l=<LIST>) {
+			print TEMP $l;
+		}
+		close TEMP;
+		close LIST;
+		unlink $ListFile;
+		if($Nlist>0) {
+			rename($TmpFile,$ListFile);
+		} else {
+			$MustMakeMainIndex=1;
+			rmdir($SubDir);
+			print "Removed subdir: $SubDir\n";
+		}
+		unlink $TmpFile;
+	}
+}
+
+sub SetUID {					# set UID to that of owner
+						# of the archive home directory
+
+local($dev,$ino,$mode,$nlink,$uid) = stat($Home);	# see who's the owner
+
+$> = $uid;					# set new UID
+
+unless($> == $uid) {
+	MyDie("Cannot switch UID to $uid");
+}
+}
+
+__END__
+
+PRINTHEADER
+
+This utility processes mail messages or mail folders to extract messages
+into separated files and to generate an Hypertext index.
+
+It may be used either interactively or as a mail filter.
+
+Usage: MailArchive [-d] [-r] [-x] [-f MailFile] HomePath
+
+       MailArchive [-m] [-c] [-h] [-v]
+
+where: HomePath specifies the directory where text files and the index file
+                are stored.
+
+       -d       Debug mode: print out debug information.
+
+       -f       The next argument is the Mail folder to process.
+
+       -r       Operate in 'Rebuild mode'. Recreates the hypertext index
+                from the list of text files in the specified directory.
+
+       -x       Remove expired messages from the archive.
+
+       -u       Unconditionally put messages into archive (Ignore Access
+                control mechanism).
+
+       -c       Print Copyright notice.
+
+       -h       Print this help page.
+
+       -m       Print out the entire user's manual in LaTeX format.
+
+       -v       Print out the Version number only.
+
+
+__COPYRIGHT__	# End of short help. Starting Copyright message
+
+PRINTHEADER
+
+MailArchive was developed by Luca Fini at the Osservatorio Astrofisico
+di Arcetri (Firenze, Italy).  Permission is granted to copy this
+software, to redistribute it on a nonprofit basis, and to use it for any
+purpose, subject to the following restrictions and understandings.
+
+1. Any copy made of this software must include this copyright notice in
+   full.
+
+2. All materials developed as a consequence of the use of this software
+   shall duly acknowledge such use, in accordance with the usual
+   standards of acknowledging credit in academic research.
+
+3. The author have made no warranty or representation that the operation
+   of this software will be error-free or suitable for any application,
+   and he is under no obligation to provide any services, by way of
+   maintenance, update, or otherwise.  The software is an experimental
+   prototype offered on an as-is basis.
+
+4. Redistribution for profit requires the express, written permission of
+   the author.
+
+__MANUAL__	# End of copyright message. Starting usage manual.
+
+\documentstyle[12pt]{article}
+%%\setlength{\textwidth}{15truecm}
+%%\setlength{\textheight}{20.5truecm}
+%%\setlength{\oddsidemargin}{0.5truecm}
+%%\setlength{\evensidemargin}{0.5truecm}
+
+\oddsidemargin  =-1cm                    %       left    margin
+\topmargin      =-1.5cm                  %       top     margin
+\evensidemargin =-1cm                    %       right   margin
+\textwidth      14.5cm
+\textheight     22.cm
+\hoffset        1.6cm
+%
+\hyphenation{Ma-il-Arch-i-ve Arc-Ac-count The-Ar-chi-ve}
+
+\begin{document}
+
+\pagestyle{empty}
+\null
+%
+\medskip
+\bigskip
+\bigskip
+
+\begin{center}
+{\LARGE \sc MailArchive}  \\
+\medskip
+{\large \em
+PRINTVERSION
+}
+\end{center}
+
+\bigskip
+\centerline{\large Luca Fini$^1$}
+\centerline{\large \em lfini@arcetri.astro.it}
+
+\normalsize
+\vspace{5 cm}
+\centerline{$^1$Osservatorio Astrofisico di Arcetri}
+\vspace{8 cm}
+
+\centerline{\bf Arcetri Technical Report N$^\circ$ 5/1995}
+\centerline{\bf Firenze, Agosto 1995}
+
+\newpage
+
+\vspace{7 cm}
+
+\begin{quote}
+\noindent{\large \bf Sommario}\\
+\small \it
+{\sc MailArchive} \`e uno script {\em Perl} che filtra messaggi di posta
+elettronica e li organizza in una struttura ad archivio provvista di un
+indice ipertestuale. L'indice \`e scritto in linguaggio {\sc html}
+(HyperText Markup Language) in modo che l'archivio pu\`o essere gestito
+da un server HTTP (come ad esempio {\tt httpd} di NCSA) consentendo l'accesso
+mediante un {\em Browser} WWW come {\em Lynx}, {\em Mosaic} o {\em
+Netscape}.
+La procedura pu\`o opzionalmente utilizzare un sistema di indici inversi 
+che consente di rendere pi\`u efficienti le
+ricerche testuali nell'archivio. L'uscita prodotta dalla
+procedura di ricerca \`e anch'essa in {\sc html}.
+{\sc MailArchive} pu\`o essere usato per facilitare l'organizzazione di
+documenti in una struttura accessibile mediante {\em browsers} WWW.
+\end{quote}
+
+\vspace{1.5 cm}
+
+\begin{quote}
+\noindent{\large \bf Abstract}\\
+\small \it
+{\sc MailArchive} is a {\em Perl} script which processes mail messages
+and stores them in a sort of archive provided with an hypertext index.
+The index is formatted in {\sc html} (HyperText Markup Language) so that
+the archive can be managed by an HTTP server (such as NCSA {\tt httpd}) and
+accessed by a WWW browser such as {\em Lynx}, {\em Mosaic}, {\em
+Netscape}, etc.
+The script optionally supports the creation and maintenance of a reverse
+index so that very efficient textual searches can be performed. 
+The output of the search procedure is also {\sc html}.
+{\sc MailArchive} may be used to ease the organization of any kind of pieces
+of information which must be accessed by WWW browsers.
+\end{quote}
+
+\newpage
+\setcounter{page}{1}
+\pagestyle{plain}
+
+\pagenumbering{roman}
+
+\centerline{COPYRIGHT NOTICE}
+
+\vskip 0.5cm
+
+\noindent
+{\sc MailArchive} was developed by Luca Fini at the Osservatorio Astrofisico
+di Arcetri (Firenze, Italy).  Permission is granted to copy this
+software, to redistribute it on a nonprofit basis, and to use it for any
+purpose, subject to the following restrictions and understandings.
+
+\begin{enumerate}
+\item Any copy made of this software must include this copyright notice in
+   full.
+
+\item All materials developed as a consequence of the use of this software
+   shall duly acknowledge such use, in accordance with the usual
+   standards of acknowledging credit in academic research.
+
+\item The author have made no warranty or representation that the operation
+   of this software will be error-free or suitable for any application,
+   and he is under no obligation to provide any services, by way of
+   maintenance, update, or otherwise.  The software is an experimental
+   prototype offered on an as-is basis.
+
+\item Redistribution for profit requires the express, written permission of
+   the author.
+\end{enumerate}
+
+\vskip 1.cm
+
+\centerline{RELEASE CONTENTS}
+
+\vskip 0.5cm
+
+\noindent
+{\sc MailArchive} is distributed as a compressed {\tt tar} archive file
+named:
+\begin{quotation}
+ {\tt MailArchive.tgz}. 
+\end{quotation}
+The archive should contain the following files:
+
+\begin{list}{}{
+                \setlength{\leftmargin}{2.8cm}
+                \setlength{\labelwidth}{2.4cm}
+}
+
+\item[{\tt MailArchive}~] A mail filter and folder processor to create and
+		         maintain archives with hypertext index and searching
+		         capabilities.
+
+\item[{\tt MAsearch.pl}~] An {\sc html} form processing script which allows 
+                         searches on archives created by {\sc MailArchive}.
+
+\item[{\tt .MAconfig}~]   An example configuration file.
+
+\item[{\tt .MAtemplate}~] An example {\sc html} script template used by 
+                         MailArchive to create and update {\sc html} 
+                         documents from which archives can be accessed.
+
+\end{list}
+
+\newpage
+\vspace{1. cm}
+
+\centerline{ADDITIONAL SOFTWARE REQUIRED}
+
+\vskip 0.5cm
+
+{\sc MailArchive} assumes the availability of a number of standard Unix
+utilities and some additional software to function properly. Here follows a list
+of everything is needed.
+
+\begin{itemize}
+
+\item You need {\em Perl} 5.x installed and running. All scripts assume 
+  that it is installed in the directory /usr/local/bin, and must be
+  modified for different locations.
+
+\item You need a standard version of {\tt sendmail} up and running on your 
+  machine (it is the UNIX standard utility that processes incoming and
+  outgoing mail).
+
+\item You also need an HTTP server installed and running to be able to browse
+  the archive and to make searches. The scripts have been tested with NCSA
+  {\tt httpd}, but should work with other servers supporting {\sc forms}.
+
+\item The server will be useless if you don't have a suitable client program
+  ({\em Mosaic}, {\em Lynx}, {\em Netscape}, can do the job).
+
+\item You also need the {\em Perl} form processing library {\tt cgi-lib.pl}.
+
+  It is a library of {\em Perl} Routines to Manipulate CGI input written by
+  S.E.Bren\-ner.
+  
+  I used the version copyrighted 1993 with modifications by Meng Weng 
+  Wong \footnote{E-mail: {\tt mengwong@seas.upenn.edu}}
+  and identified as "fsVersion 2.0". Any current version should work.
+
+  {\tt cgi-lib.pl} may be found in any ftp repository containing WWW support
+  software and must be installed in a library directory automatically 
+  searched by {\em Perl} (the usual default is {\tt /usr/lib/perl}).
+
+\item If you want to be able to use the fast textual search system to
+      search documents according to their content you also need {\em Glimpse}.
+
+  {\em Glimpse}\footnote{E-mail to {\tt glimpse@cs.arizona.edu} for info.}
+  is an indexing and searching engine written by  Udi Manber, Sun Wu, 
+  and Burra Gopal, Department of Computer Science, University of Arizona,
+  Tucson, AZ 85721.
+
+  You may get {\em Glimpse} from:   {\tt ftp://cs.arizona.edu/glimpse}
+
+  The scripts have been tested both with version 1.1 and version 2.0.
+
+
+\end{itemize}
+
+\newpage
+
+\tableofcontents
+
+\newpage
+
+\pagenumbering{arabic}
+
+
+\section{Introduction}
+
+The {\sc MailArchive} {\em Perl} script was born from the need to
+provide a small group of people with a simple way to store a number of
+messages in an archive which allows a fast and easy retrieval of
+messages.
+
+The LAN at the Osservatorio di Arcetri is a pretty complex structure
+where some services are centralized and managed by a small group of
+professionals while some research groups have their own ``system manager''
+(usually a scientist who spends some time doing management) to cope with
+special needs (dedicated software packages and the like).
+
+The scenario is thus a number of people who must informally cooperate
+at least by informing each other of changes of software configurations,
+installation of new packages, bug fixes, and so on. At the same time it
+is useful to have an historical memory of what has happened to the
+system.
+
+{\sc MailArchive} was designed as a natural extension of a mailing list we
+previously used to do the job.  When a piece of information must be stored in the
+archive it is sent as a mail message to a fake username which starts 
+{\sc MailArchive} by using a standard feature of the {\tt sendmail} program.
+{\sc MailArchive} stores the message in a file and adds a line in a list of
+messages, written in the {\sc html} language, which provides hypertext links
+to the message.  At the same time a reverse index which allows fast
+textual search operations is updated.
+
+Document retrieval is performed by accessing the hypertext lists, or by
+performing a search via a suitable form processing script which
+returns an {\sc html} formatted list of relevant documents.
+
+In order to increase the flexibility of the systems some options have
+been added: the script may process either single mail messages or entire
+mail folders, as generated by the mail utility program (this is how an
+archive may be initially built from a set of existing mail folders); it is
+possible to include an expiration date in a document, so that it may be
+deleted when expired; it is possible to rebuild the document index from
+the stored document files (this allows to manually delete documents and
+update the index accordingly).
+
+
+{\sc MailArchive}'s flexibility allows to use it for various purposes,
+from maintaining a long term historical archive which continuously grows
+with time as explained above, to the management of a posting system for
+short term messages.
+
+
+\section{Document Processing \label{s:doc} }
+
+{\sc MailArchive} can process documents stored into a mail folder, as created
+by the UNIX mail utility program or can be used to filter mail messages
+actually sent to a fake mail address.
+In both cases messages are splitted into separate files and stored
+into subdirectories of the archive main directory.  Subdirectories are named
+according to the year contained in the message date, so that all messages
+in the archive are grouped by year.
+The files containing the {\sc html} lists are created (or updated) in the
+same archive main directory.
+
+The document list may either follow the directory structure (i.e.: it is
+subdivided by year) or may be flat (all documents are grouped together
+in a single list).
+
+Figure~\ref{f:dir} shows a picture of the archive file structure.
+
+\begin{figure}[htb]
+
+\begin{quotation}
+{\tt \begin{tabbing}
+
+     parola \= parola         \= 99apr99-00.txt \= parola \kill
+
+TheArchive/ \>                \>              \> {\rm Main archive directory} \\
+            \> index.html     \>              \> {\rm Main Index           } \\
+            \> 1993index.html \>              \> {\rm List of 1993 documents} \\
+            \> 1994index.html \>              \> {\rm List of 1994 documents} \\
+            \> 1995index.html \>              \> {\rm List of 1995 documents} \\
+            \> 1993/          \>              \> {\rm 1993 Document directory} \\
+            \>                \> Napr16-00.txt  \> {\rm Document 1} \\
+            \>                \> Nmar18-00.txt  \> {\rm Document 2} \\
+            \>                \> Nmar18-01.txt  \> {\rm Document 3} \\
+            \>                \> ....         \> {\rm ....} \\
+            \> 1994/          \>              \> {\rm 1994 Document directory} \\
+            \>                \> ....         \> {\rm ....} \\
+            \> 1995/          \>              \> {\rm 1995 Document directory} \\
+            \>                \> Eapr20-00.txt \> {\rm Document 1} \\
+            \>                \> Eapr20-01.txt \> {\rm Document 2} \\
+            \>                \> ....         \> {\rm ....} \\
+            \>                \> .... \\
+\end{tabbing} }
+\end{quotation}
+\caption{{\sc MailArchive} directory structure \label{f:dir}}
+\end{figure}
+
+The uppercase E in the file name (see under directory 1995) tells that
+the file has an expiration date (see Section~\ref{s:expir} below)
+and may be subject to deletion.
+
+The main list file ({\tt index.html}\footnote{You may notice that this is
+the file that the HTTP server automatically accesses when the URL
+points to the archive main directory (see the HTTP server documentation
+for details).}) may either contain a list of
+years which link to yearly lists (files {\tt 1993index.html},
+{\tt 1994index.html}, etc.), or directly contain the file list
+if you select the ``flat'' list option (see Section~\ref{ss:MAconf}).
+The documents in {\sc html} lists may be  ordered as needed (see Section~\ref{ss:MAconf}).
+
+\subsection{Folder Processing}
+
+To initiate an archive from a mail folder, or to add an entire mail
+folder to an existing archive, you must run the script interactively:
+
+{\tt \begin{verbatim}
+         MailArchive -f FolderName TheArchive
+\end{verbatim} }
+
+\noindent
+where: {\tt FolderName} is the file containing the mail folder
+and {\tt TheArchive} is the main archive directory.
+
+\noindent
+E.g:
+{\tt \begin{verbatim}
+   MailArchive -f MyFolder /usr/local/ArcAccount
+\end{verbatim} }
+
+\subsection{Mail Message Processing}
+
+The script may be used as a mail filter to process messages sent to a
+special e-mail address adding them to an archive. To add a new document to the
+archive a user can send a mail message to that address which will be
+processed by {\sc MailArchive} in the same way as described in the previous
+paragraph.
+
+If the Subject of the message begins exactly with the word: {\tt
+!DEBUG}, then the message is not stored but useful debug information is
+sent back to the caller (a similar effect may be obtained with the
+option -d when using the program interactively). 
+
+The {\tt sendmail} Unix utility provides the mechanism to use {\sc
+MailArchive} as a mail filter (see Section~\ref{s:inst} for
+details).
+
+\section{Installing {\sc MailArchive} \label{s:inst}}
+
+In order to install {\sc MailArchive} as a mail filter
+and set up an archive you must follow
+the procedure explained below:
+
+\begin{itemize}
+\item The {\sc MailArchive} script must be copied in a proper directory,
+maybe where you  usually put all your favorite scripts
+(such as {\tt /usr/local/bin}).
+
+\item For each archive managed by {\sc MailArchive}, a fake user account
+provided with a home directory must be created. It isn't necessary that
+the account can be logged into: a no password account is quite suitable.
+The account home directory may be (and usually will be)
+the same as the archive main directory.
+This directory must be accessible to the HTTP server which will be used for
+browsing and searching documents.
+
+\item On the home directory you put a file named {\tt .forward} 
+containing a single
+line as in the following example:
+
+{\tt \begin{verbatim}
+"|/usr/local/bin/MailArchive /usr/local/ArcAccount"
+\end{verbatim} }
+
+The double quotes ({\tt "}) are required. In the example the
+fake username is {\em ArcAccount} and its home directory 
+is {\tt /usr/local/Arc\-Ac\-co\-unt}. 
+
+The above command line requires that when a mail message for the user
+ArcAccount is received it is processed by sending it to the
+standard input of the script {\sc MailArchive}.
+
+\item
+Since the script will be run by {\tt sendmail}
+under the {\sc uid} of the user to whom the message is sent, it is necessary
+that the main archive directory is owned by that user, with read and write
+access.
+
+\item The file {\tt .MAconfig} on the archive main directory 
+must contain the proper set of configuration parameters. The distribution
+kit provides an example of such a file and more details can be found in
+Section~\ref{ss:MAconf}.
+
+\item The file {\tt .MAtemplate} must contain a template for the
+creation of the main list. The distribution kit provides an example of
+the template file and more details can be found in
+Section~\ref{s:browse}. It will allow the script to create and
+update the {\sc html} document through which the archive can be
+browsed and searched.
+
+
+\item To allow search operations on the archive the {\sc form}
+processing script {\tt MA\-se\-arch.pl} must be executable by the HTTP
+server. E.g.: it could be installed in the standard CGI-script directory
+of the server\footnote{You may find directions in the HTTP server
+documentation.  E.g.: see the online help of the NCSA {\tt httpd} at:
+      \begin{quotation}
+	{\tt http://hoohoo.ncsa.uiuc.edu/docs/Overview.html}
+      \end{quotation}}.
+
+
+\end{itemize}
+
+\section{Configuring {\sc MailArchive}}
+
+\subsection{The Configuration File ({\tt .MAconfig}) \label{ss:MAconf}}
+
+Many aspects of the {\sc MailArchive} processing modes can be configured by
+commands contained in the file {\tt .MAconfig} on the archive
+main directory (see the example file  included in the distribution kit).
+
+Configuration commands start at column one of the line with a keyword 
+sometimes followed by values; keywords which require a value must
+be terminated with a colon {\tt :}. Keywords and values can be
+separated by any number of blanks. Keywords are not case sensitive.
+Lines not starting with a valid keyword are simply ignored (so no error
+checking is performed\footnote{A list of configuration parameters values
+as derived from the configuration file can be obtained by invoking the
+script in debug mode (option {\tt -d}, or Subject: {\tt !DEBUG}).}).
+
+Here follows a list of keywords with explanations.
+
+\begin{itemize}
+
+\item {\bf Allow}. Begins the list of accepted mail addresses for
+      access control (see Section~\ref{ss:access} for details).
+      The lines between {\tt Allow} and {\tt End~Allow} (see below) 
+      are read in
+      as such, so no comment can be present anywhere.
+
+\item {\bf Default Life:} It is followed by the default life time (number
+      of days) to be used for all documents added to the archive if a
+      valid expiration date or life time specification (see
+      Section~\ref{s:expir} for details) is not included in the message.
+
+\item {\bf End Allow}. Terminates the list of accepted mail addresses.
+      The list begins with the keyword {\tt Allow} (see above).
+
+\item {\bf Glimpseindex:}. It is followed by the full path of the command
+      {\tt gli\-mpse\-in\-dex}. If not specified the indexing procedure is not
+      executed and the search procedure will use {\tt grep}.
+
+\item {\bf Index Numbers}. If this keyword is specified numbers which
+      appear in the text will be included into the reverse index. By
+      default only words are included. This option has no effect unless
+      the Glimpseindex option is also present.
+
+\item {\bf Flat List}.
+      Selects the ``Flat'' format of the {\sc html} document list (see
+      Section~\ref{s:doc} for details on structure of the document
+      list).
+
+\item {\bf Mail Command:}. It is followed by the the command
+      to be used to mail back the acknowledgment message or reply to
+      {\tt !DEBUG} requests. 
+      A typical example is the following:
+
+{\tt \begin{verbatim}
+mail -s \"MailArchive reply\"  $Sender < $MailMessage
+\end{verbatim} }
+
+      The line is evaluated by {\em Perl} prior
+      of execution to expand the sender name (variable {\tt \$Sender}) 
+      and the name of the temporary file holding the message (variable
+      {\tt \$MailMessage}. Note that double quotes ({\tt "}) must
+      be escaped.
+      There is no default, if it is not specified no acknowledge, error
+      or debug message will be mailed back to the sender of the message.
+
+\item {\bf List Head:}. It is followed by a valid {\sc html} string which
+      will be printed as such at the beginning of the document list
+      (see section~\ref{ss:flist} for details). 
+      The default is the {\sc html} code {\tt <dl>}.
+
+\item {\bf List Line:}. It is followed by a valid {\sc html} string
+      which will be interpreted to print each line of the document list
+      (see section~\ref{ss:flist} for details). 
+      This is also connected with the value of keyword {\bf
+      sort}. The line is a {\em Perl} string which is evaluated before
+      printing. The following example shows the default provided by
+      {\sc MailArchive}:
+
+{\tt \begin{verbatim}
+<dt> $Date - From: $From $Expir <dd>$Anchor<p>
+\end{verbatim} }
+
+      the line contains text and {\sc html} formatting commands ({\tt <dt>}, 
+      {\tt <dd>}, {\tt <p>}), which are printed as such,
+      and the variables: {\tt \$Date}, {\tt \$From},
+      {\tt \$Expir}, {\tt \$Anchor}, which are
+      substituted by the date of the document, the sender name, the
+      expiration date 
+      and the ``Anchor'', i.e: the content of the subject field
+      which ``points'' to the related document. The expiration date may
+      be empty, if not defined in the document, otherwise it is the
+      string: 
+\begin{quotation}
+{\tt (Expires: dd mmm yyyy)}.
+\end{quotation}
+
+      The above elements may
+      be intermixed in any way provided that the resulting string is
+      a single line and at least the variable {\tt \$Anchor} is included.
+
+\item {\bf List Tail:}. It is followed by a valid {\sc html} string which
+      will be printed as such at the end of the document list
+      (see section~\ref{ss:flist} for details). A suitable default
+      is provided (The default is the {\sc html} code: {\tt </dl>}).
+
+\item {\bf Nested List}.
+      Selects the ``Nested'' format of the {\sc html} document list (see
+      Section~\ref{s:doc} for details on structure of the document
+      list).
+
+\item {\bf Require Expiration}. If this keyword is included no message
+      will be accepted unless a valid expiration date or life time 
+      specification (see Section~\ref{s:expir} for details) is included
+      in the message.
+
+\item {\bf Require Subject}. If this keyword is included no message
+      will be accepted unless the ``Subject'' field is included
+      in the message header.
+
+\item {\bf Sort:}. It is followed by the sort command suitable to
+      sort the document list prior of its inclusion in the list document.
+      You must take into account that the format of each line is 
+      specified in item {\bf List line} (see section~\ref{ss:flist})
+      for details. A default suitable for the default format of list
+      file lines is provided:
+\begin{quotation}
+        {\tt \verb%sort +3nr -4 +2Mr -3 +1nr -2%}
+\end{quotation}
+      This makes a list ordered in descending date order.
+      
+\item {\bf wwwPath:}. It is followed by the absolute path to the archive 
+      directory as seen by a WWW client. It will usually be different
+      from the directory path due to the redirection capabilities of the
+      {\tt http} server. If not specified it is assumed that the archive
+      is seen under the {\tt Document Root}\footnote{You may find
+      information in the {\tt httpd} server documentation.}.
+\end{itemize}
+
+\subsection{The Template File ({\tt .MAtemplate}) \label{ss:MAtempl}}
+
+{\sc MailArchive} builds the {\sc html} document list on the basis
+of a template file which must be edited to suit the particular needs.
+The file named {\tt .MAtemplate} must be on the archive main directory
+and will contain mostly {\sc html} text with some special flags.
+
+\begin{figure}[htb]
+
+\begin{quotation}
+{\small
+\begin{tabbing}
+
+999 \= moretext \kill
+
+1  \> {\tt <html><head><title> Test Archive </title></head><body>} \\
+\\
+2  \> {\tt <h1> Test Archive</h1>} \\
+\\
+3  \> {\tt <h2> Complete list: </h2>} \\
+\\
+4  \> {\tt <!--Include Point>} \\
+\\
+5  \> {\tt <h2> Text search: </a> </h2>} \\
+6  \> {\tt <blockquote>} \\
+\\
+7  \> {\tt <form method="POST" } \\
+8  \> {\tt       action="http://www.arcetri.astro.it/cgi-bin/MAsearch.pl">} \\
+\\
+9  \> {\tt <input type=hidden name=DirPath } \\
+10 \> {\tt        value="/usr/local/HTDOCS/CC/admlog">} \\
+ \\
+11 \> {\tt Type a string to search for: } \\
+12 \> {\tt <input type=text size=30 name="RegExp">} \\
+ \\
+13 \> {\tt <input type="submit" value="Do search">} \\
+\\
+14 \> {\tt <p>} \\
+\\
+15 \> {\tt Case sensitive :} \\
+16 \> {\tt <input type="checkbox" name="Case" value=1>} \\
+\end{tabbing}}
+\end{quotation}
+\caption{{\sc html} template script for archive accessing ({\em Part-1}) \label{f:MAtempl1}}
+\end{figure}
+
+\begin{figure}[htb]
+
+\begin{quotation}
+{\small
+\begin{tabbing}
+
+999 \= moretext \kill
+
+17 \> {\tt Allowed errors: } \\
+18 \> {\tt <input type=text name="SpellErrs" size=1> } \\
+19 \> {\tt (Number of spelling errors allowed)} \\
+ \\
+20 \> {\tt <br>} \\
+21 \> {\tt <!--Uncomment the following line to allow debug mode selection>} \\
+22 \> {\tt <!--"Debug" mode:<input type="checkbox" name="Debug" value=1>} \\
+ \\
+23 \> {\tt </form>} \\
+ \\
+24 \> {\tt <p>} \\
+25 \> {\tt Returns the list of messages containing the given string. } \\
+26 \> {\tt The search is based on words (numbers are not searched for). } \\
+27 \> {\tt A regular expression can be specified.} \\
+28 \> {\tt Boolean expressions are expressed as follows:<p>} \\
+29 \> {\tt <ul>} \\
+30 \> {\tt <li> AND : word1;word2 <p>} \\
+31 \> {\tt <li> OR : word1,word2 <p>} \\
+32 \> {\tt </ul>} \\
+33 \> {\tt The two forms cannot be intermixed.} \\
+34 \> {\tt </blockquote>} \\
+ \\
+35 \> {\tt </body></html>} \\
+\end{tabbing}}
+\end{quotation}
+\caption{{\sc html} template script for archive accessing ({\em Part-2}) 
+\label{f:MAtempl2}}
+\end{figure}
+
+
+Figures~\ref{f:MAtempl1} and~\ref{f:MAtempl2} show an example of
+template file.  For those unfamiliar with the {\sc html} language\footnote{
+many sources of information about {\sc html} are available. E.g.: see the
+on-line help at NCSA:
+\begin{quotation}
+{\tt  http://www.ncsa.uiuc.edu/General/Internet/WWW/HTMLPrimer.html }
+\end{quotation} }
+line numbers have been added in the figures to non blank lines as
+references for the following explanations (number are thus
+{\bf not part} of the template file!).
+
+\begin{list}{}{
+                \setlength{\leftmargin}{1.4cm}
+                \setlength{\labelwidth}{1cm}
+}
+\item[1] Title of the document just for reference: it is not
+         displayed. The line is required by the {\sc html} language.
+
+\item[2] A string of text which appears in big characters: the actual
+         readable title. You may edit or delete it at will.
+
+\item[3] Another title, but smaller (say a subtitle).
+
+\item[4] Here is the point where {\sc MailArchive} puts the year list,
+         or the document list. The line may appear anywhere in the file,
+         but must be unchanged to be recognized.
+
+\item[5] Another subtitle.
+
+\item[6] The following text is somewhat indented.
+
+\item[7] Here starts the {\sc form} item. It will appear as a field which
+          can be filled by the user with buttons to select special
+          actions and so on.
+
+\item[8] The URL\footnote{The {\em Universal Resource Locator} in the
+                          WWW terminology, is the 
+                          description of how to get to a file across 
+                          the Network.} of the {\sc form} script 
+          which processes the search request (see below). You must 
+          change this line accordingly to the actual location of the 
+          script {\tt MAsearch.pl}.
+
+\item[9-10] A ``hidden'' parameter\footnote{A ``hidden'' parameter is not
+            displayed on the form screen but is sent, with its value, to
+            the processing procedure.} which specifies the path of the 
+            archive main directory (it is an absolute path to avoid 
+            ambiguities).
+            The ``value'' of the parameter must be modified according to
+            the actual path of your archive.
+
+\item[11-12] These lines generate the field that the user will fill with the 
+             search string or expression. Line 11 is simply a comment,
+             line 12 must remain unchanged (the "size" specification
+             can be different, anyway).
+
+\item[13]    The ``start~searching'' button. When you ``press'' it the
+             request is sent to the server. The value field is the text
+             written on the button: you may change it to suit your needs.
+
+\item[14]    This puts some space (starts a new paragraph).
+
+\item[15-16] These two lines add a check button with a comment text.
+             If the button is checked the corresponding argument
+             is sent to the script and requires a "case sensitive"
+             search (default is not case sensitive). The lines are 
+             not required.
+
+\item[17-19] These lines generate another fill-in box where the user can
+             specify the number of spelling errors allowed in string
+             comparisons (this is a standard feature of {\tt glimpse}
+             and will have no effect if the archive doesn't implement
+             the reverse index and is searched with {\tt grep}).
+             The lines are not required.
+             The default is exact matching.
+
+\item[20]    Starts a new line on the screen.
+
+\item[21-22]  Comments. Line 22, as such, is an {\sc html} comment. 
+             If you uncomment it (by removing the characters {\tt !--}
+             at the beginning) a check box is included in the {\sc
+             form}: if checked the {\sc form} processing script will
+             include some debug information in the return file.
+
+\item[23]    This line terminates the {\sc form} section of the {\sc html}
+             file.
+
+\item[24-34] These lines are comment text which is included for the
+             convenience of the user.
+
+\item[35]    End of the {\sc html} file.
+
+\end{list}
+
+
+\subsection{How the File List is Built \label{ss:flist}}
+
+The building of the document list file depends on a number of
+customizable elements. Here follows a brief explanation of the process.
+
+The list of archived files must be either ``Flat'' (i.e.: all documents
+are gathered together in a single list) or ``Nested'' (i.e.: a main list
+will contain pointers to sub lists where documents  are gathered
+on a yearly basis).
+You can choose the format most suitable to your needs by the
+related configuration parameter.
+
+If a flat list is selected it is built with the following rules:
+\begin{enumerate}
+
+\item The template file is scanned up to the special line: {\tt
+\verb$<!--Include Point >$} and lines are output to the list file.
+
+\item A list of years is generated into the list file by using the
+      ``unnumbered list'' format ({\tt <ul>} ... {\tt <li>} ... 
+      {\tt </ul>} tags) provided by {\sc html}.
+
+\item The scanning of the template file resumes up to the end.
+
+\item For each year a document sublist file is generated as follows:
+
+\begin{enumerate}
+
+\item Some fixed {\sc html} lines are put in the file to define
+      a suitable title.
+
+\item  The line defined as {\tt List~Head} in the configuration file
+       is put in the file, followed by an {\sc html} comment line to
+       be used by the document searching script.
+
+\item The list of document follows. Each line is formatted as dictated
+      by the line defined as {\tt List~Line} in the configuration file,
+      all the lines are sorted using the command specified in 
+      the related configuration parameter.
+
+\item   The line defined as {\tt List~Tail} in the configuration file
+       follows.
+
+\item Suitable, and fixed, file ending commands are put in the file.
+\end{enumerate}
+\end{enumerate}
+
+If a flat list is selected, the processing is exactly as explained
+above, except that the list of files is expanded within the main list,
+where the include flag is found following steps {\em b}, {\em c}, and 
+{\em d} above.
+
+
+\subsection{Access Control \label{ss:access}}
+
+{\sc MailArchive} provides a rough access control mechanism in order to
+avoid unauthorized archiving of documents. The mechanism is very
+simple and will not prevent malicious attacks, but can filter
+out archiving attempts due to errors, automatic mail responders and
+the like.
+
+The access control is based on a list of allowed addresses contained in
+the ``Allow'' section of the configuration file.  The Allow section
+begins with the keyword {\tt Allow} and ends with the keyword {\tt
+End~Allow} (see details on the configuration file in
+Section~\ref{ss:MAconf}).  If it is not empty, then only messages coming
+from the mail addresses listed in the section  will be stored in the
+archive. Each address line may actually be a valid {\em Perl} regular
+expression (without the enclosing~//) as in the following examples:
+
+\begin{quotation}
+{\tt \begin{tabbing}
+\verb!^lfini@(.*\.)?\.oat\.ts\.it$! \= {\rm user lfini at any node of {\tt oat.ts.it}}\\
+\verb!as\.arizona\.edu\$!           \> {\rm everybody at {\tt as.arizona.edu} }\\
+\verb!^[^\@:\.]+$!                  \> {\rm all local users, (i.e.: addresses}\\
+                                    \> {\rm not containing {\tt @.:}) }
+\end{tabbing}}
+\end{quotation}
+
+
+\noindent
+Note that some characters (e.g.: {\tt @.}) in mail addresses 
+must be escaped with ``$\backslash$''
+because they have special meaning in {\em Perl} regular expressions.
+The match is case insensitive.
+
+\section{How to Format Messages}
+
+Documents to be stored in the archive are mail messages
+which can be sent by any standard mail utility, but some guidelines
+on how to format messages may be useful.
+
+\begin{itemize}
+\item {\sc MailArchive} uses the message date as date for the document
+and the subject of the message as title in lists.
+So the subject of the mail message must be meaningful\footnote{There
+isn't any way to enforce meaningfulness of titles, but
+specification of the subject field may be enforced by means of
+the related configuration parameter (see Section~\ref{ss:MAconf}).}.
+
+\item The message body is not formatted in any way. So you may only use
+      ASCII text and must provide for rough formatting of the text.
+
+\item The message may contain the redefinition of some fields of the
+      mail message header, namely:
+
+\begin{quotation}
+\noindent
+	{\tt !Date:~~~~} followed by a valid date.\\
+	{\tt !From:~~~~} followed by any string.\\
+	{\tt !Subject:~} followed by any string.
+\end{quotation}
+        The date format must follow the rules for standard mail messages
+        as specified in RFC~822\footnote{Practically speaking if you want
+        to archive a message originated by somebody else and you want 
+        it to have any of the fields From, Date and Subject from the original 
+        message you simply leave the original From: and Date: lines of the 
+        message prepending a {\tt !} character to them.}. Here are some
+        examples of valid dates:
+\begin{quotation}
+\noindent
+{\tt 
+\begin{verbatim}
+!Date: Tue, 08 Aug 1995 13:50:42 +0200
+!Date: 7 jul 94
+\end{verbatim} }
+\end{quotation}
+
+\item The message may also contain a line which specifies an expiration date
+      for that document\footnote{The
+      specification of an expiration date can be enforced by means of
+      the related configuration parameter (see
+      Section~\ref{ss:MAconf}).} (see Section~\ref{s:expir} below).
+
+\end{itemize}
+
+\subsection{Managing Expiration Dates \label{s:expir}}
+
+The message body of a message processed by {\sc MailArchive} may contain
+the indication of an expiration date. 
+In this case the expiration date is indicated in the header
+of the archived document and the file containing the document is
+named in a way which indicates that it is subject to deletion.
+
+The expiration date may be specified in two different ways:
+
+\begin{enumerate}
+\item As an absolute date, with a line beginning with the word
+{\tt !Expir} followed by any characters, followed by a colon ({\tt :}),
+followed by a date in {\em day~month~year} format, 
+as in the following examples:
+
+{\tt \begin{quotation}
+
+\noindent
+!Expiring: 22 Jun 1996 \\
+!Expiration date :27 Aug 1997 \\
+!Expir: 12 Feb 1998
+\end{quotation} }
+
+\item As a life duration, with a line beginning with the word
+{\tt !Life} followed by any characters, followed by a colon ({\tt :}),
+followed by a number of days,
+as in the following examples:
+
+{\tt \begin{quotation}
+
+\noindent
+!Life: 30 \\
+!Life of document in days:365
+\end{quotation} }
+
+The expiration date will be computed by
+adding the specified number of days to the document date.
+
+\end{enumerate}
+
+{\sc MailArchive} itself may be used to remove expired documents from the
+archive (updating lists accordingly) as in the following example:
+
+{\tt \begin{verbatim}
+        MailArchive -x /usr/local/ArcAccount
+\end{verbatim} }
+
+\noindent 
+Here the archive whose 
+main directory is {\tt ArcAccount} is searched
+to identify expired documents, which are removed both
+from the archive and from the lists.
+Document files are not actually deleted but instead they are moved onto
+directory:
+
+{\tt \begin{verbatim}
+        /usr/local/ArcAccount/Expired
+\end{verbatim} }
+
+If the keyword: {\tt Require~Expiration} is included in the configuration
+file  a message is not accepted unless it contains a valid
+expiration specification (see Section~\ref{ss:MAconf}).
+
+\section{Rebuilding Lists}
+
+{\sc MailArchive} may also be used to rebuild the list files based on the
+message files stored under the specified directory.  
+This may be useful to rebuild the lists from scratch, E.g. if
+any document has been deleted manually or if you want to change the
+format of the list. It is also recommended to rebuild indexes when
+you've edited some file in the archive in order to update the reverse
+indexes, if they're included in your configuration.
+
+To rebuild the lists you may use a command as in the following
+example:
+
+{\tt \begin{verbatim}
+      MailArchive -r /usr/local/ArcAccount
+\end{verbatim} }
+
+\noindent
+The command will be usually run with {\bf root} privileges\footnote{
+{\sc MailArchive} will set the effective {\sc uid} to that of the
+main archive directory owner before proceeding.}.
+
+
+\section{The Browsing Interface \label{s:browse}}
+
+An archive created and maintained by {\sc MailArchive} can be browsed
+and searched by means of a WWW interface such as {\em Mosaic}, {\em
+Netscape}, or {\em Lynx}.
+
+To do that you need an HTTP server installed and running which can
+access the archive main directory. I've used NCSA {\tt httpd}, but any
+other HTTP server supporting {\sc forms} should work.
+
+The browser will access the archive via a proper {\sc html} page with
+the required links and, possibly, with a {\sc form} section which allows
+to specify search expressions.
+
+The {\sc html} page is created and maintained by {\sc MailArchive} as
+described in Section~\ref{ss:flist}.
+
+To support searching of documents based on the content, it is necessary
+that the {\sc form} processing procedure {\tt MAsearch.pl}
+has been installed and is available to the HTTP server.
+
+{\tt MAsearch.pl} is a 
+standard {\sc form} processing procedure, written in {\em Perl}, 
+which processes text searching
+requests in an archive generated by {\sc MailArchive} and returns
+an {\sc html} formatted document with a list of pointers to selected 
+messages. {\tt MAsearch.pl} uses  the information contained in
+the configuration file {\tt .MAconfig} described in Section~\ref{ss:MAconf}
+to format the returned
+document so that it has exactly the same format as the one used for
+the search, with the difference that it only contains references
+to selected files instead of the full list.
+
+{\tt MAsearch.pl} will be usually put in the standard directory for HTTP
+{\sc form} processing scripts and will be executed in the same way as
+any other {\sc form} processing script (see directions in the HTTP
+server documentation).
+
+Some documentation about the script and how to debug it may be found
+at the beginning of the script itself.
+
+\section{{\sc MailArchive} Options \label{s:opti}}
+Here follows a complete description of all the options recognized by 
+MailArchive.
+
+\subsection{Processing Options}
+
+The following options specify the way {\sc MailArchive} operates
+on documents. They are used when the script is executed interactively.
+
+
+\begin{itemize}
+\item[{\bf -d}]  Debug mode: print out debug information. This switch is
+           used mainly in interactive mode. A similar effect may be
+           obtained when the script is executed as a mail filter by sending
+           a message whose subject begins with the word {\tt !DEBUG}.
+
+
+\item[{\bf -f}]  The next argument is the the filename of a mail folder to process.
+           The mail folder must have the correct format (it must be generated
+           by the Unix {\tt mail} utility).
+
+\item[{\bf -r}]  Operate in 'Rebuild mode'. Recreates the document list
+           from the document files in the specified archive.  The
+           standard input is ignored. This mode is useful to update the
+           index when a text message is modified or deleted from the
+           directory. The reverse index is also rebuilt, if the
+           configuration file requires so (see
+           Section~\ref{ss:MAconf}).
+
+\item[{\bf -x}]  Remove expired documents from the archive. Document files
+           are removed from the archive and moved to the subdirectory
+           {\tt Expired} under the archive main directory. The document
+           list is updated accordingly and the reverse index is rebuilt,
+           if the configuration file requires so (see
+           Section~\ref{ss:MAconf}).
+
+\end{itemize}
+
+\subsection{Documentation Options}
+
+The following options will produce various forms of documentation.
+
+\begin{itemize}
+\item[{\bf -c}]  Print the Copyright notice and exit.
+\item[{\bf -h}]  Print a short help page and exit.
+\item[{\bf -m}]  Print the entire user's manual (i.e. the document you're
+                 reading right now) in \LaTeX~format and exit.
+                 You may redirect the output into a file and process
+		it with \LaTeX.
+\item[{\bf -v}]  Prints the version number (without the ending newline).
+                 
+\end{itemize}
+
+\end{document}
+

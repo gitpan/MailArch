@@ -1,0 +1,54 @@
+<html><head><Title> Test Archive </title></head><body>
+
+<h1> Test Archive</h1>
+
+<h2> Complete list: </h2>
+
+<!--Include Point >
+
+<h2> Text search: </a> </h2>
+<blockquote>
+
+<form method="POST" 
+      action="http://www.arcetri.astro.it/~lfini/MAsearch.pl">
+
+<input type=hidden name=DirPath 
+       value="/home/sisifo/lfini/public_html/admlog">
+<input type=hidden name=wwwPath 
+       value="http://www.arcetri.astro.it/~lfini/admlog">
+
+Type a string to search for: 
+<input type=text size=30 name="RegExp">
+
+<input type="submit" value="Do search">
+<p>
+Case sensitive :
+<input type="checkbox" name="Case" value=1>
+
+Allowed errors: 
+<input type=text name="SpellErrs" size=1> 
+(Number of spelling errors allowed)
+
+<br>
+<! Uncomment the following line to allow debug mode selection>
+
+<! "Debug" mode:<input type="checkbox" name="Debug" value=1>
+
+</form>
+
+<p>
+Returns the list of messages containing the given string. 
+The search is based on words (numbers are not searched for). 
+A regular expression can be specified.
+Boolean expressions are expressed as follows:<p>
+<ul>
+<li> AND : word1;word2 <p>
+<li> OR : word1,word2 <p>
+</ul>
+The two forms cannot be intermixed.
+</blockquote>
+<p><hr>
+<address>
+Luca Fini (lfini@arcetri.astro.it)
+</address>
+</body></html>
